@@ -1,0 +1,75 @@
+name: Reassemble release asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft or published release tag
+        required: true
+        type: string
+      output_name:
+        description: Final release asset name
+        required: true
+        type: string
+      chunk_prefix:
+        description: Prefix shared by the temporary chunk assets
+        required: true
+        type: string
+      sha256:
+        description: Expected SHA-256 of the reassembled asset
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  reassemble:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      OUTPUT_NAME: ${{ inputs.output_name }}
+      CHUNK_PREFIX: ${{ inputs.chunk_prefix }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+    steps:
+      - name: Download and verify chunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          chunk_dir="$RUNNER_TEMP/release-chunks"
+          output_path="$RUNNER_TEMP/$OUTPUT_NAME"
+          mkdir -p "$chunk_dir"
+
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$CHUNK_PREFIX*" \
+            --dir "$chunk_dir"
+
+          mapfile -t chunks < <(find "$chunk_dir" -maxdepth 1 -type f -name "$CHUNK_PREFIX*" -printf '%f\n' | LC_ALL=C sort)
+          if [[ ${#chunks[@]} -eq 0 ]]; then
+            echo "No release chunks matched $CHUNK_PREFIX" >&2
+            exit 1
+          fi
+
+          : > "$output_path"
+          for chunk in "${chunks[@]}"; do
+            cat "$chunk_dir/$chunk" >> "$output_path"
+          done
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$output_path" | sha256sum --check --strict
+
+          gh release upload "$TAG" "$output_path" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Remove temporary chunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" \
+            --jq ".[] | select(.name | startswith(\"$CHUNK_PREFIX\")) | .id" |
+          while IFS= read -r asset_id; do
+            [[ -n "$asset_id" ]] || continue
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done
